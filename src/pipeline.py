@@ -15,11 +15,8 @@ with open(TRANSCRIPT_FILE, "r", encoding="utf-8") as f:
     data = json.load(f)
 
 
-def build_clips(
-    segments,
-    min_duration_sec=MIN_CLIP_DURATION_SEC,
-    max_duration_sec=MAX_CLIP_DURATION_SEC,
-):
+
+def build_clips(segments, min_duration_sec=MIN_CLIP_DURATION_SEC, max_duration_sec=MAX_CLIP_DURATION_SEC):
     """Объединяет соседние транскрипт-сегменты в клипы длиной min..max секунд."""
     if not segments:
         return []
@@ -89,26 +86,14 @@ def build_clips(
     return normalized
 
 
-def export_video_clip(video_path, start_sec, end_sec, output_path):
-    (
-        ffmpeg.input(video_path, ss=start_sec, to=end_sec)
-        .output(output_path, vcodec="libx264", acodec="aac", movflags="+faststart")
-        .overwrite_output()
-        .run(quiet=True)
-    )
-
-
 clips = build_clips(data.get("segments", []))
 
-# Нарезка видеоклипов
+# Нарезка клипов
 for idx, seg in enumerate(clips):
-    export_video_clip(
-        VIDEO_FILE,
-        seg["start"],
-        seg["end"],
-        f"{OUTPUT_DIR}/clip_{idx}.mp4",
-    )
-
+    start_ms = int(seg["start"] * 1000)
+    end_ms = int(seg["end"] * 1000)
+    clip = audio[start_ms:end_ms]
+    clip.export(f"{OUTPUT_DIR}/clip_{idx}.wav", format="wav")
 
 # Создание SRT
 
@@ -130,7 +115,7 @@ with open(f"{OUTPUT_DIR}/audio_subtitles.srt", "w", encoding="utf-8") as f:
 if clips:
     durations = [seg["end"] - seg["start"] for seg in clips]
     print(
-        f"Generated {len(clips)} video clips in {OUTPUT_DIR}. "
+        f"Generated {len(clips)} clips in {OUTPUT_DIR}. "
         f"Duration range: {min(durations):.2f}s - {max(durations):.2f}s"
     )
 else:
