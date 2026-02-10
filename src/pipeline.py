@@ -197,7 +197,7 @@ def select_clips_heuristic(segments, min_dur, max_dur, target_count):
     return sorted(selected, key=lambda c: c["start"])
 
 
-def build_units(segments, max_words=120, min_duration=20):
+def build_units(segments, max_words=80, min_duration=12):
     units = []
     cur = None
     word_count = 0
@@ -363,8 +363,18 @@ def try_select_clips_llm(segments, min_dur, max_dur, target_count):
         print("LLM selection failed: no valid IDs returned.")
         return []
 
+    # If LLM returned too few IDs, fill with top-scoring units
+    if len(selected_ids) < target_count:
+        scored_units = [(i + 1, u.get("score", 0.0)) for i, u in enumerate(units)]
+        scored_units.sort(key=lambda x: x[1], reverse=True)
+        for unit_id, _ in scored_units:
+            if len(selected_ids) >= target_count:
+                break
+            if unit_id not in selected_ids:
+                selected_ids.append(unit_id)
+
     clips = []
-    for idx in selected_ids:
+    for idx in selected_ids[:target_count]:
         unit = units[idx - 1]
         start = float(unit["start"])
         end = float(unit["end"])
