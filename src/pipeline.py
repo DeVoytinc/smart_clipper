@@ -3,6 +3,8 @@ import os
 import re
 import shutil
 import subprocess
+import urllib.error
+import urllib.request
 
 VIDEO_FILE = "data/input2.mp4"
 TRANSCRIPT_FILE = "data/audio_transcript.json"
@@ -248,43 +250,124 @@ def try_select_clips_llm(segments, min_dur, max_dur, target_count):
         )
 
     prompt = (
-        "You are selecting interesting moments for YouTube Shorts from a movie. "
-        "Each line has start-end timestamps and text. "
-        f"Pick {target_count} moments (30-60s each), focusing on humor, emotion, "
+        "Select interesting moments for YouTube Shorts from a movie transcript. "
+        "Each line has start-end timestamps and text with an ID. "
+        f"Pick {target_count} IDs (30-60s each), focusing on humor, emotion, "
         "dramatic tension, twists, or memorable quotes. "
-        "Return ONLY valid JSON: "
-        "[{\"start\": 0.0, \"end\": 0.0, \"reason\": \"...\"}, ...]. "
-        "Use timestamps from the provided lines, no overlap.\n\n"
+        "Return ONLY a JSON array of integers (IDs), e.g. [3, 7, 12]. "
+        "No extra keys, no markdown, no commentary. If unsure, return []. "
+        "Use IDs from the provided lines, no overlap.\n\n"
         + "\n".join(lines)
     )
 
+    raw = ""
+    items = []
+    # Prefer Ollama HTTP API with JSON enforcement
     try:
-        result = subprocess.run(
-            ["ollama", "run", OLLAMA_MODEL],
-            input=prompt,
-            text=True,
-            capture_output=True,
-            check=True,
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "format": {
+                "type": "array",
+                "items": {"type": "integer"},
+            },
+            "options": {"temperature": 0},
+        }
+        req = urllib.request.Request(
+            "http://127.0.0.1:11434/api/generate",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
         )
-    except subprocess.CalledProcessError as exc:
-        stderr = exc.stderr.strip() if exc.stderr else "unknown ollama error"
-        print(f"LLM selection failed: {stderr}")
-        return []
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            api_body = resp.read().decode("utf-8", errors="replace")
+        raw = api_body.strip()
+        api_data = json.loads(api_body)
+        response_text = api_data.get("response", "").strip()
+        if response_text:
+            try:
+                parsed = json.loads(response_text)
+                if isinstance(parsed, list):
+                    items = parsed
+            except json.JSONDecodeError:
+                items = []
+            if not items:
+                arr_start = response_text.find("[")
+                arr_end = response_text.rfind("]")
+                if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+                    try:
+                        items = json.loads(response_text[arr_start:arr_end + 1])
+                    except json.JSONDecodeError:
+                        items = []
+            if not items:
+                # Last resort: extract integers from response text
+                ids = [int(x) for x in re.findall(r"\b\d+\b", response_text)]
+                if ids:
+                    items = ids
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        items = []
 
-    raw = (result.stdout or "").strip()
-    try:
-        items = json.loads(raw)
-    except json.JSONDecodeError:
-        print("LLM selection failed: invalid JSON response.")
+    if not items:
+        # Fallback to CLI
+        try:
+            result = subprocess.run(
+                ["ollama", "run", OLLAMA_MODEL],
+                input=prompt.encode("utf-8"),
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            stderr_bytes = exc.stderr or b""
+            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+            print(f"LLM selection failed: {stderr or 'unknown ollama error'}")
+            return []
+
+        stdout_bytes = result.stdout or b""
+        raw = stdout_bytes.decode("utf-8", errors="replace").strip()
+        try:
+            items = json.loads(raw)
+        except json.JSONDecodeError:
+            items = []
+            arr_start = raw.find("[")
+            arr_end = raw.rfind("]")
+            if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+                try:
+                    items = json.loads(raw[arr_start:arr_end + 1])
+                except json.JSONDecodeError:
+                    items = []
+            if not items:
+                ids = [int(x) for x in re.findall(r"\b\d+\b", raw)]
+                if ids:
+                    items = ids
+            if not items:
+                print("LLM selection failed: invalid JSON response.")
+                return []
+
+    if raw:
+        write_raw_llm(OUTPUT_DIR_LLM if CLIP_SELECTOR == "both" else OUTPUT_DIR, raw)
+
+    # Map selected IDs to unit timestamps
+    max_id = len(lines)
+    selected_ids = []
+    for item in items:
+        try:
+            idx = int(item)
+        except (ValueError, TypeError):
+            continue
+        if 1 <= idx <= max_id:
+            selected_ids.append(idx)
+    # Deduplicate while preserving order
+    seen = set()
+    selected_ids = [x for x in selected_ids if not (x in seen or seen.add(x))]
+    if not selected_ids:
+        print("LLM selection failed: no valid IDs returned.")
         return []
 
     clips = []
-    for item in items:
-        try:
-            start = float(item["start"])
-            end = float(item["end"])
-        except (KeyError, ValueError, TypeError):
-            continue
+    for idx in selected_ids:
+        unit = units[idx - 1]
+        start = float(unit["start"])
+        end = float(unit["end"])
         if end <= start:
             continue
         if end - start < min_dur:
@@ -293,7 +376,7 @@ def try_select_clips_llm(segments, min_dur, max_dur, target_count):
             end = start + max_dur
 
         texts = [seg.get("text", "").strip() for seg in segments if seg["start"] >= start and seg["end"] <= end]
-        clips.append({"start": start, "end": end, "texts": texts, "reason": item.get("reason", "")})
+        clips.append({"start": start, "end": end, "texts": texts, "reason": "llm_id"})
 
     filtered = []
     for c in sorted(clips, key=lambda c: c["start"]):
@@ -415,6 +498,12 @@ def write_selection_json(clips, output_dir, filename="selection.json"):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=True, indent=2)
 
+
+def write_raw_llm(output_dir, raw_text, filename="selection_raw.txt"):
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(raw_text or "")
 
 def log_selected(label, clips):
     if not clips:
