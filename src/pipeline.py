@@ -1,8 +1,9 @@
 import json
-from pydub import AudioSegment
 import os
 
-AUDIO_FILE = "data/audio.wav"
+import ffmpeg
+
+VIDEO_FILE = "data/input2.mp4"
 TRANSCRIPT_FILE = "data/audio_transcript.json"
 OUTPUT_DIR = "clips"
 MIN_CLIP_DURATION_SEC = 30
@@ -13,7 +14,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 with open(TRANSCRIPT_FILE, "r", encoding="utf-8") as f:
     data = json.load(f)
 
-audio = AudioSegment.from_file(AUDIO_FILE)
 
 
 def build_clips(segments, min_duration_sec=MIN_CLIP_DURATION_SEC, max_duration_sec=MAX_CLIP_DURATION_SEC):
@@ -96,6 +96,7 @@ for idx, seg in enumerate(clips):
     clip.export(f"{OUTPUT_DIR}/clip_{idx}.wav", format="wav")
 
 # Создание SRT
+
 def format_time(seconds):
     ms = int(seconds * 1000)
     h = ms // 3600000
@@ -103,6 +104,7 @@ def format_time(seconds):
     s = (ms % 60000) // 1000
     ms = ms % 1000
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
 
 with open(f"{OUTPUT_DIR}/audio_subtitles.srt", "w", encoding="utf-8") as f:
     for idx, seg in enumerate(clips):
