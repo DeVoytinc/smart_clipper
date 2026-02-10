@@ -1,23 +1,311 @@
 import json
 import os
-
-import ffmpeg
+import re
+import shutil
+import subprocess
 
 VIDEO_FILE = "data/input2.mp4"
 TRANSCRIPT_FILE = "data/audio_transcript.json"
 OUTPUT_DIR = "clips"
+OUTPUT_DIR_LLM = "clips_llm"
 MIN_CLIP_DURATION_SEC = 30
 MAX_CLIP_DURATION_SEC = 60
+TARGET_CLIP_COUNT = int(os.getenv("TARGET_CLIP_COUNT", "8"))
+CLIP_SELECTOR = os.getenv("CLIP_SELECTOR", "both").strip().lower()
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR_LLM, exist_ok=True)
 
 with open(TRANSCRIPT_FILE, "r", encoding="utf-8") as f:
     data = json.load(f)
 
+def require_ffmpeg():
+    if shutil.which("ffmpeg") is None:
+        raise FileNotFoundError("ffmpeg not found in PATH. Install ffmpeg and retry.")
 
+
+def export_video_clip(video_path: str, start_sec: float, end_sec: float, output_path: str):
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{start_sec:.3f}",
+        "-to",
+        f"{end_sec:.3f}",
+        "-i",
+        video_path,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        "-shortest",
+        output_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else "unknown ffmpeg error"
+        raise RuntimeError(f"ffmpeg failed for {output_path}: {stderr}") from exc
+
+RU_KEYWORDS_ESC = [
+    "\u0441\u043c\u0435\u0448\u043d\u043e",
+    "\u0448\u0443\u0442\u043a\u0430",
+    "\u0430\u0445\u0430\u0445\u0430",
+    "\u043b\u044e\u0431\u043b\u044e",
+    "\u043d\u0435\u043d\u0430\u0432\u0438\u0436\u0443",
+    "\u0441\u0435\u043a\u0440\u0435\u0442",
+    "\u043f\u0440\u0430\u0432\u0434\u0430",
+    "\u0441\u043c\u0435\u0440\u0442\u044c",
+    "\u043e\u043f\u0430\u0441\u043d\u043e",
+    "\u043f\u043e\u0447\u0435\u043c\u0443",
+    "\u0437\u0430\u0447\u0435\u043c",
+    "\u0436\u0438\u0437\u043d\u044c",
+    "\u0441\u0443\u0434\u044c\u0431\u0430",
+    "\u043d\u0435\u0432\u0435\u0440\u043e\u044f\u0442\u043d\u043e",
+    "\u0448\u043e\u043a",
+    "\u0441\u0442\u0440\u0430\u0445",
+    "\u0443\u0436\u0430\u0441",
+    "\u0432\u043f\u0435\u0440\u0432\u044b\u0435",
+    "\u043d\u0438\u043a\u043e\u0433\u0434\u0430",
+    "\u0432\u0441\u0435\u0433\u0434\u0430",
+    "\u043f\u0440\u0435\u0434\u0430\u0442\u0435\u043b\u044c",
+    "\u0441\u043c\u044b\u0441\u043b",
+    "\u0437\u0430\u0434\u0443\u043c\u0430\u0439\u0441\u044f",
+]
+
+KEYWORDS = {
+    "ru": [bytes(w, "utf-8").decode("unicode_escape") for w in RU_KEYWORDS_ESC],
+    "en": [
+        "funny", "joke", "haha", "lol", "sarcasm",
+        "love", "hate", "fear", "shock", "secret", "truth", "lie",
+        "kill", "death", "save", "danger", "betray",
+        "why", "how", "never", "always", "first time",
+        "meaning", "life", "fate", "unbelievable", "insane",
+    ],
+}
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def score_segment(seg) -> float:
+    text = normalize_text(seg.get("text", ""))
+    if not text:
+        return 0.0
+
+    score = 0.0
+    score += text.count("!") * 0.7
+    score += text.count("?") * 0.5
+    score += text.count("...") * 0.3
+
+    for kw in KEYWORDS["ru"]:
+        if kw in text:
+            score += 1.2
+    for kw in KEYWORDS["en"]:
+        if kw in text:
+            score += 1.0
+
+    word_count = len(text.split())
+    if 4 <= word_count <= 22:
+        score += 0.6
+    elif word_count > 40:
+        score -= 0.4
+
+    return score
+
+
+def build_clip_around_index(segments, center_idx, min_dur, max_dur):
+    start_idx = center_idx
+    end_idx = center_idx
+    start = segments[start_idx]["start"]
+    end = segments[end_idx]["end"]
+
+    while end - start < min_dur and (start_idx > 0 or end_idx < len(segments) - 1):
+        if start_idx > 0:
+            start_idx -= 1
+            start = segments[start_idx]["start"]
+        if end - start >= min_dur:
+            break
+        if end_idx < len(segments) - 1:
+            end_idx += 1
+            end = segments[end_idx]["end"]
+
+    while end - start > max_dur and start_idx < center_idx:
+        start_idx += 1
+        start = segments[start_idx]["start"]
+
+    while end - start > max_dur and end_idx > center_idx:
+        end_idx -= 1
+        end = segments[end_idx]["end"]
+
+    if end - start > max_dur:
+        end = start + max_dur
+
+    texts = [segments[i].get("text", "").strip() for i in range(start_idx, end_idx + 1)]
+    return {
+        "start": start,
+        "end": end,
+        "texts": texts,
+        "center_idx": center_idx,
+    }
+
+
+def clips_overlap(a, b) -> bool:
+    return not (a["end"] <= b["start"] or b["end"] <= a["start"])
+
+
+def select_clips_heuristic(segments, min_dur, max_dur, target_count):
+    scored = [(i, score_segment(seg)) for i, seg in enumerate(segments)]
+    scored = [(i, s) for i, s in scored if s > 0.0]
+
+    if not scored:
+        return build_clips(segments, min_dur, max_dur)
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    candidates = []
+    max_candidates = min(len(scored), target_count * 6)
+    for i, s in scored[:max_candidates]:
+        clip = build_clip_around_index(segments, i, min_dur, max_dur)
+        clip["score"] = s
+        candidates.append(clip)
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    selected = []
+    for c in candidates:
+        if len(selected) >= target_count:
+            break
+        if all(not clips_overlap(c, s) for s in selected):
+            selected.append(c)
+
+    if len(selected) < target_count:
+        fallback = build_clips(segments, min_dur, max_dur)
+        for c in fallback:
+            if len(selected) >= target_count:
+                break
+            if all(not clips_overlap(c, s) for s in selected):
+                selected.append(c)
+
+    return sorted(selected, key=lambda c: c["start"])
+
+
+def build_units(segments, max_words=120, min_duration=20):
+    units = []
+    cur = None
+    word_count = 0
+    for seg in segments:
+        text = seg.get("text", "").strip()
+        if cur is None:
+            cur = {
+                "start": seg["start"],
+                "end": seg["end"],
+                "texts": [text],
+                "score": score_segment(seg),
+            }
+            word_count = len(text.split())
+            continue
+
+        cur["end"] = seg["end"]
+        cur["texts"].append(text)
+        cur["score"] += score_segment(seg)
+        word_count += len(text.split())
+
+        if word_count >= max_words or (cur["end"] - cur["start"]) >= min_duration:
+            units.append(cur)
+            cur = None
+            word_count = 0
+
+    if cur is not None:
+        units.append(cur)
+
+    return units
+
+
+def try_select_clips_llm(segments, min_dur, max_dur, target_count):
+    if shutil.which("ollama") is None:
+        print("LLM selection skipped: ollama not found.")
+        return []
+
+    units = build_units(segments)
+    if len(units) > 200:
+        units.sort(key=lambda u: u["score"], reverse=True)
+        units = units[:160]
+        units.sort(key=lambda u: u["start"])
+
+    lines = []
+    for idx, u in enumerate(units, start=1):
+        text = " ".join(t for t in u["texts"] if t).strip()
+        if not text:
+            continue
+        lines.append(
+            f"{idx}. {u['start']:.2f}-{u['end']:.2f}: {text}"
+        )
+
+    prompt = (
+        "You are selecting interesting moments for YouTube Shorts from a movie. "
+        "Each line has start-end timestamps and text. "
+        f"Pick {target_count} moments (30-60s each), focusing on humor, emotion, "
+        "dramatic tension, twists, or memorable quotes. "
+        "Return ONLY valid JSON: "
+        "[{\"start\": 0.0, \"end\": 0.0, \"reason\": \"...\"}, ...]. "
+        "Use timestamps from the provided lines, no overlap.\n\n"
+        + "\n".join(lines)
+    )
+
+    try:
+        result = subprocess.run(
+            ["ollama", "run", OLLAMA_MODEL],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.strip() if exc.stderr else "unknown ollama error"
+        print(f"LLM selection failed: {stderr}")
+        return []
+
+    raw = (result.stdout or "").strip()
+    try:
+        items = json.loads(raw)
+    except json.JSONDecodeError:
+        print("LLM selection failed: invalid JSON response.")
+        return []
+
+    clips = []
+    for item in items:
+        try:
+            start = float(item["start"])
+            end = float(item["end"])
+        except (KeyError, ValueError, TypeError):
+            continue
+        if end <= start:
+            continue
+        if end - start < min_dur:
+            end = start + min_dur
+        if end - start > max_dur:
+            end = start + max_dur
+
+        texts = [seg.get("text", "").strip() for seg in segments if seg["start"] >= start and seg["end"] <= end]
+        clips.append({"start": start, "end": end, "texts": texts, "reason": item.get("reason", "")})
+
+    filtered = []
+    for c in sorted(clips, key=lambda c: c["start"]):
+        if all(not clips_overlap(c, s) for s in filtered):
+            filtered.append(c)
+        if len(filtered) >= target_count:
+            break
+
+    return filtered
 
 def build_clips(segments, min_duration_sec=MIN_CLIP_DURATION_SEC, max_duration_sec=MAX_CLIP_DURATION_SEC):
-    """Объединяет соседние транскрипт-сегменты в клипы длиной min..max секунд."""
+    """Merge neighboring segments into clips of min..max seconds."""
     if not segments:
         return []
 
@@ -50,7 +338,6 @@ def build_clips(segments, min_duration_sec=MIN_CLIP_DURATION_SEC, max_duration_s
     if current_clip is not None:
         clips.append(current_clip)
 
-    # Склеиваем слишком короткие клипы с соседями, если это укладывается в максимум.
     normalized = []
     i = 0
     while i < len(clips):
@@ -86,17 +373,6 @@ def build_clips(segments, min_duration_sec=MIN_CLIP_DURATION_SEC, max_duration_s
     return normalized
 
 
-clips = build_clips(data.get("segments", []))
-
-# Нарезка клипов
-for idx, seg in enumerate(clips):
-    start_ms = int(seg["start"] * 1000)
-    end_ms = int(seg["end"] * 1000)
-    clip = audio[start_ms:end_ms]
-    clip.export(f"{OUTPUT_DIR}/clip_{idx}.wav", format="wav")
-
-# Создание SRT
-
 def format_time(seconds):
     ms = int(seconds * 1000)
     h = ms // 3600000
@@ -106,17 +382,105 @@ def format_time(seconds):
     return f"{h:02}:{m:02}:{s:02},{ms:03}"
 
 
-with open(f"{OUTPUT_DIR}/audio_subtitles.srt", "w", encoding="utf-8") as f:
-    for idx, seg in enumerate(clips):
-        f.write(f"{idx + 1}\n")
-        f.write(f"{format_time(seg['start'])} --> {format_time(seg['end'])}\n")
-        f.write(" ".join(t for t in seg["texts"] if t).strip() + "\n\n")
+def write_srt(clips, output_dir, filename="audio_subtitles.srt"):
+    srt_path = os.path.join(output_dir, filename)
+    with open(srt_path, "w", encoding="utf-8") as f:
+        for idx, seg in enumerate(clips):
+            f.write(f"{idx + 1}\n")
+            f.write(f"{format_time(seg['start'])} --> {format_time(seg['end'])}\n")
+            f.write(" ".join(t for t in seg["texts"] if t).strip() + "\n\n")
 
-if clips:
-    durations = [seg["end"] - seg["start"] for seg in clips]
-    print(
-        f"Generated {len(clips)} clips in {OUTPUT_DIR}. "
-        f"Duration range: {min(durations):.2f}s - {max(durations):.2f}s"
+
+def export_clips(clips, output_dir):
+    require_ffmpeg()
+    os.makedirs(output_dir, exist_ok=True)
+    for idx, seg in enumerate(clips):
+        output_path = os.path.join(output_dir, f"clip_{idx}.mp4")
+        export_video_clip(VIDEO_FILE, seg["start"], seg["end"], output_path)
+    write_srt(clips, output_dir)
+
+def write_selection_json(clips, output_dir, filename="selection.json"):
+    os.makedirs(output_dir, exist_ok=True)
+    payload = []
+    for seg in clips:
+        payload.append(
+            {
+                "start": seg["start"],
+                "end": seg["end"],
+                "reason": seg.get("reason", ""),
+                "text": " ".join(t for t in seg.get("texts", []) if t).strip(),
+            }
+        )
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=True, indent=2)
+
+
+def log_selected(label, clips):
+    if not clips:
+        print(f"{label}: no clips selected.")
+        return
+    print(f"{label}: selected {len(clips)} clips:")
+    for idx, seg in enumerate(clips, start=1):
+        text = " ".join(t for t in seg.get("texts", []) if t).strip()
+        if len(text) > 160:
+            text = text[:157] + "..."
+        reason = seg.get("reason", "")
+        reason_part = f" | reason: {reason}" if reason else ""
+        print(f"  {idx}. {seg['start']:.2f}-{seg['end']:.2f}{reason_part} | {text}")
+
+segments = data.get("segments", [])
+
+heuristic_clips = select_clips_heuristic(
+    segments,
+    MIN_CLIP_DURATION_SEC,
+    MAX_CLIP_DURATION_SEC,
+    TARGET_CLIP_COUNT,
+)
+
+llm_clips = []
+if CLIP_SELECTOR in ("llm", "both"):
+    llm_clips = try_select_clips_llm(
+        segments,
+        MIN_CLIP_DURATION_SEC,
+        MAX_CLIP_DURATION_SEC,
+        TARGET_CLIP_COUNT,
     )
+
+if CLIP_SELECTOR == "llm":
+    clips = llm_clips if llm_clips else heuristic_clips
+    log_selected("LLM" if llm_clips else "Heuristic (fallback)", clips)
+    if llm_clips:
+        write_selection_json(llm_clips, OUTPUT_DIR)
+    export_clips(clips, OUTPUT_DIR)
+elif CLIP_SELECTOR == "heuristic":
+    clips = heuristic_clips
+    log_selected("Heuristic", clips)
+    export_clips(clips, OUTPUT_DIR)
 else:
-    print("No clips generated: transcript has no segments")
+    log_selected("Heuristic", heuristic_clips)
+    export_clips(heuristic_clips, OUTPUT_DIR)
+    if llm_clips:
+        log_selected("LLM", llm_clips)
+        write_selection_json(llm_clips, OUTPUT_DIR_LLM)
+        export_clips(llm_clips, OUTPUT_DIR_LLM)
+
+
+def print_summary(label, clips, output_dir):
+    if clips:
+        durations = [seg["end"] - seg["start"] for seg in clips]
+        print(
+            f"{label}: {len(clips)} clips in {output_dir}. "
+            f"Duration range: {min(durations):.2f}s - {max(durations):.2f}s"
+        )
+    else:
+        print(f"{label}: no clips generated.")
+
+if CLIP_SELECTOR == "llm":
+    print_summary("LLM", llm_clips if llm_clips else heuristic_clips, OUTPUT_DIR)
+elif CLIP_SELECTOR == "heuristic":
+    print_summary("Heuristic", heuristic_clips, OUTPUT_DIR)
+else:
+    print_summary("Heuristic", heuristic_clips, OUTPUT_DIR)
+    if llm_clips:
+        print_summary("LLM", llm_clips, OUTPUT_DIR_LLM)
