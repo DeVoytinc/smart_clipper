@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 
 from clip_utils import select_clips_heuristic
 from config import (
@@ -34,6 +35,11 @@ def main():
 
     if args.download:
         video_path = download_rutube(args.download, output_dir="data")
+
+    if not os.path.isfile(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+    if not os.path.isfile(transcript_path):
+        raise FileNotFoundError(f"Transcript file not found: {transcript_path}")
 
     with open(transcript_path, "r", encoding="utf-8") as f:
         data = json.load(f)
